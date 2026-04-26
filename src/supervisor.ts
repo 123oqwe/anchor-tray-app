@@ -179,6 +179,7 @@ export function defaultStack(opts: { backendPort?: number; useLocalDev?: boolean
       { name: "anchor-system-mcp",   command: "npx",  args: ["tsx", `${HOME}/anchor-system-mcp/src/index.ts`], env },
       { name: "anchor-screen-mcp",   command: "npx",  args: ["tsx", `${HOME}/anchor-screen-mcp/src/index.ts`], env },
       { name: "anchor-code-mcp",     command: "npx",  args: ["tsx", `${HOME}/anchor-code-mcp/src/index.ts`], env },
+      { name: "anchor-shell-mcp",    command: "npx",  args: ["tsx", `${HOME}/anchor-shell-mcp/src/index.ts`], env },
     ];
   }
 
@@ -191,5 +192,6 @@ export function defaultStack(opts: { backendPort?: number; useLocalDev?: boolean
     { name: "anchor-system-mcp",   command: "npx", args: ["-y", "@anchor/system-mcp"], env },
     { name: "anchor-screen-mcp",   command: "npx", args: ["-y", "@anchor/screen-mcp"], env },
     { name: "anchor-code-mcp",     command: "npx", args: ["-y", "@anchor/code-mcp"], env },
+    { name: "anchor-shell-mcp",    command: "npx", args: ["-y", "@anchor/shell-mcp"], env },
   ];
 }

@@ -43,21 +43,46 @@ System-tray companion app for [anchor](https://github.com/123oqwe/anchor-backend
                   (anchor-backend's MCP host connects to all 6)
 ```
 
-## Build (next session)
+## Two ways to run
+
+### A. Node CLI (works today, no Rust needed)
 
 ```bash
-# Prereqs: Rust + Tauri CLI
-cargo install tauri-cli
-
-# Scaffold
-cargo tauri init
-
-# Dev
-cargo tauri dev
-
-# Build for distribution
-cargo tauri build  # → .dmg / .msi / .AppImage
+pnpm install
+pnpm build
+ANTHROPIC_API_KEY=sk-... node dist/cli.js start --dev   # foreground
+node dist/cli.js status     # in another terminal
+node dist/cli.js logs anchor-backend
 ```
+
+### B. Tauri tray app (build yourself; needs Rust)
+
+Tauri scaffold is **complete** in `src-tauri/`. To build:
+
+```bash
+# 1. Install Rust (one-time)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source $HOME/.cargo/env
+
+# 2. Install Tauri CLI (one-time)
+cargo install tauri-cli --version "^2"
+
+# 3. Generate icons (one-time — see src-tauri/icons/README.md)
+
+# 4. Run in dev mode
+cargo tauri dev    # builds + launches; tray icon appears in menubar
+
+# 5. Build distributable
+cargo tauri build  # → src-tauri/target/release/bundle/{dmg, app, msi, deb, appimage}
+```
+
+### Distribution caveats (post-launch work)
+
+- **macOS .dmg**: needs Apple Developer ID for code signing (~$99/year) + notarization. Without these, the app shows scary "unidentified developer" warning.
+- **Windows .msi**: needs EV code-signing certificate ($300+/year) to avoid SmartScreen warnings.
+- **Linux .AppImage / .deb**: no signing required, but may need additional packaging for distro repos.
+
+For "ship to developers" today, **path A** (Node CLI) is enough. Path B (signed Tauri binary) is post-launch work.
 
 ## Why Tauri (not Electron)?
 

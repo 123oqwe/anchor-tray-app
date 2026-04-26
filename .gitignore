@@ -5,3 +5,6 @@ dist/
 .env
 .DS_Store
 src-tauri/target/
+src-tauri/Cargo.lock
+src-tauri/icons/source.png
+src-tauri/icons/icon.iconset/

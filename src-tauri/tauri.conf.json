@@ -1,0 +1,63 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Anchor",
+  "version": "0.1.0",
+  "identifier": "ai.anchor.tray",
+  "build": {
+    "beforeDevCommand": "",
+    "beforeBuildCommand": "",
+    "frontendDist": "../src",
+    "devUrl": "http://localhost:1420"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Anchor",
+        "width": 600,
+        "height": 400,
+        "visible": false,
+        "skipTaskbar": true,
+        "decorations": true,
+        "transparent": false,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": null
+    },
+    "trayIcon": {
+      "iconPath": "icons/icon.png",
+      "iconAsTemplate": true,
+      "id": "anchor-tray",
+      "tooltip": "Anchor"
+    },
+    "macOSPrivateApi": false
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["dmg", "app", "msi", "deb", "appimage"],
+    "category": "Productivity",
+    "shortDescription": "Anchor — local-first personal AI",
+    "longDescription": "Anchor is a local-first personal AI runtime. The tray app supervises anchor-backend + 8 anchor-*-mcp subprocesses and gives you 1-click access to your assistant.",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/icon.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "macOS": {
+      "frameworks": [],
+      "minimumSystemVersion": "10.15",
+      "exceptionDomain": "",
+      "signingIdentity": null,
+      "providerShortName": null,
+      "entitlements": null
+    },
+    "windows": {
+      "certificateThumbprint": null,
+      "digestAlgorithm": "sha256",
+      "timestampUrl": ""
+    }
+  }
+}

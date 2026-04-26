@@ -1,6 +1,10 @@
 /**
- * Process supervisor — spawn + monitor + restart-on-crash for anchor-backend
- * + 6 anchor-*-mcp servers.
+ * Process supervisor — spawn + monitor + restart-on-crash for anchor-backend.
+ *
+ * MCP servers are NOT supervised here. They are stdio JSON-RPC peers and must
+ * be spawned by anchor-backend's MCP host (server/integrations/mcp/registry.ts)
+ * with stdin piped — supervising them with stdio:'ignore' makes them read EOF
+ * and exit immediately, triggering an infinite restart loop.
  *
  * Backoff: failed restart pauses doubling (1s, 2s, 4s, 8s, max 60s). After
  * 5 consecutive failures within 5 min, marks the service as DEGRADED and
@@ -169,29 +173,13 @@ export function defaultStack(opts: { backendPort?: number; useLocalDev?: boolean
   };
 
   if (opts.useLocalDev) {
-    // Dev mode: run from local checkouts via tsx
     const HOME = os.homedir();
     return [
-      { name: "anchor-backend",      command: "pnpm", args: ["tsx", `${HOME}/anchor-backend/server/index.ts`], env, port },
-      { name: "anchor-activity-mcp", command: "npx",  args: ["tsx", `${HOME}/anchor-activity-mcp/src/index.ts`], env },
-      { name: "anchor-browser-mcp",  command: "npx",  args: ["tsx", `${HOME}/anchor-browser-mcp/src/index.ts`], env },
-      { name: "anchor-input-mcp",    command: "npx",  args: ["tsx", `${HOME}/anchor-input-mcp/src/index.ts`], env },
-      { name: "anchor-system-mcp",   command: "npx",  args: ["tsx", `${HOME}/anchor-system-mcp/src/index.ts`], env },
-      { name: "anchor-screen-mcp",   command: "npx",  args: ["tsx", `${HOME}/anchor-screen-mcp/src/index.ts`], env },
-      { name: "anchor-code-mcp",     command: "npx",  args: ["tsx", `${HOME}/anchor-code-mcp/src/index.ts`], env },
-      { name: "anchor-shell-mcp",    command: "npx",  args: ["tsx", `${HOME}/anchor-shell-mcp/src/index.ts`], env },
+      { name: "anchor-backend", command: "pnpm", args: ["tsx", `${HOME}/anchor-backend/server/index.ts`], env, port },
     ];
   }
 
-  // Prod mode: from npm
   return [
-    { name: "anchor-backend",      command: "npx", args: ["-y", "@anchor/backend"], env, port },
-    { name: "anchor-activity-mcp", command: "npx", args: ["-y", "@anchor/activity-mcp"], env },
-    { name: "anchor-browser-mcp",  command: "npx", args: ["-y", "@anchor/browser-mcp"], env },
-    { name: "anchor-input-mcp",    command: "npx", args: ["-y", "@anchor/input-mcp"], env },
-    { name: "anchor-system-mcp",   command: "npx", args: ["-y", "@anchor/system-mcp"], env },
-    { name: "anchor-screen-mcp",   command: "npx", args: ["-y", "@anchor/screen-mcp"], env },
-    { name: "anchor-code-mcp",     command: "npx", args: ["-y", "@anchor/code-mcp"], env },
-    { name: "anchor-shell-mcp",    command: "npx", args: ["-y", "@anchor/shell-mcp"], env },
+    { name: "anchor-backend", command: "npx", args: ["-y", "@anchor/backend"], env, port },
   ];
 }

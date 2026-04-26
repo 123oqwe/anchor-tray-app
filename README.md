@@ -1,6 +1,6 @@
 # anchor-tray-app
 
-System-tray companion app for [anchor](https://github.com/123oqwe/anchor-backend). One download → starts anchor-backend + 6 anchor-*-mcp servers + shows tray icon + auto-starts on boot.
+System-tray companion app for [anchor](https://github.com/123oqwe/anchor-backend). One download → starts anchor-backend + 7 anchor-*-mcp servers + shows tray icon + auto-starts on boot.
 
 **Status: scaffold (v0.0.1)**. This repo currently holds the architecture + design + boot scripts. Tauri build is the next session's work.
 
@@ -15,12 +15,13 @@ System-tray companion app for [anchor](https://github.com/123oqwe/anchor-backend
 | anchor-system-mcp   | npm `@anchor/system-mcp` |
 | anchor-screen-mcp   | npm `@anchor/screen-mcp` |
 | anchor-code-mcp     | npm `@anchor/code-mcp` |
+| anchor-shell-mcp    | npm `@anchor/shell-mcp` (CLI-first, token-efficient) |
 
 ## What it provides
 
 1. **Tray icon** — anchor presence in macOS menubar / Windows system tray / Linux notification area.
 2. **Auto-start at boot** — launchd (Mac) / Task Scheduler (Win) / systemd user service (Linux).
-3. **MCP server lifecycle** — spawns + supervises 6 MCP servers, restarts on crash.
+3. **MCP server lifecycle** — spawns + supervises 7 MCP servers, restarts on crash.
 4. **One-click open** — clicks tray → opens anchor's web UI on `http://localhost:3001/`.
 5. **Quit / restart / status** — basic controls in tray menu.
 
@@ -73,7 +74,7 @@ Anchor's tray companion should be lightweight (it bundles 7 Node processes alrea
 ## What's NOT in this scaffold yet
 
 - Tauri project files (Cargo.toml, src-tauri/, etc) — next session
-- Process supervisor logic (spawn anchor-backend + 6 MCP servers, monitor, restart)
+- Process supervisor logic (spawn anchor-backend + 7 MCP servers, monitor, restart)
 - Tray menu (status / open UI / quit)
 - Auto-start at boot per-OS
 - Code signing (Apple Developer ID for .dmg, EV cert for .msi)

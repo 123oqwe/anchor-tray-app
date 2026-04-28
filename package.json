@@ -4,17 +4,24 @@
   "type": "module",
   "license": "MIT",
   "description": "Anchor companion: spawns + supervises anchor-backend + 6 anchor-*-mcp servers. Crash-restart, log rotation, simple CLI. Tauri tray icon planned for v0.2.",
-  "bin": { "anchor": "dist/cli.js" },
+  "bin": {
+    "anchor": "dist/cli.js"
+  },
   "main": "dist/cli.js",
-  "files": ["dist", "scripts", "README.md", "LICENSE"],
+  "files": [
+    "dist",
+    "scripts",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "build": "tsc",
     "start": "tsx src/cli.ts start",
     "dev": "tsx --watch src/cli.ts start",
     "check": "tsc --noEmit"
   },
-  "dependencies": {},
   "devDependencies": {
+    "@tauri-apps/cli": "^2.10.1",
     "@types/node": "^22.0.0",
     "tsx": "^4.19.0",
     "typescript": "^5.6.3"

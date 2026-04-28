@@ -1,220 +1,480 @@
 // Prevents additional console window on Windows in release.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
+//! Anchor tray-app — system-tray supervisor for the 3 anchor backends.
+//!
+//! Supervised services:
+//!   - anchor-backend       :3001 (user surface)
+//!   - anchor-admin-backend :3002 (operator API)
+//!   - anchor-security      :3004 (out-of-band detector + pentest)
+//!
+//! NOT supervised here: the 7 anchor-*-mcp servers. Those are stdio JSON-RPC
+//! peers and must be spawned by anchor-backend's own MCP host with stdin
+//! piped — supervising them with stdin closed makes them EOF and exit
+//! immediately. Mirror of the TS supervisor's design (src/supervisor.ts).
+//!
+//! Lifecycle:
+//!   - Each child runs on its own thread that wait()s for exit, applies
+//!     exponential backoff (1s → 2s → 4s → 8s → max 60s), and respawns.
+//!   - 5 crashes within 5 min marks a service DEGRADED (no more auto-restart;
+//!     manual restart required from tray menu).
+//!   - On app quit: sends SIGTERM to every child, waits briefly, exits.
+//!
+//! Logs: per-service file at ~/.anchor/logs/<name>.log (rotated at 10MB).
+
 use std::collections::HashMap;
+use std::env;
 use std::fs::OpenOptions;
 use std::path::PathBuf;
-use std::env;
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use tauri::{
-    menu::{Menu, MenuItem, PredefinedMenuItem, Submenu},
-    tray::{TrayIconBuilder, TrayIconEvent},
+    menu::{Menu, MenuItem, PredefinedMenuItem},
+    tray::TrayIconBuilder,
     Manager,
 };
+use tauri_plugin_autostart::MacosLauncher;
+use tauri_plugin_opener::OpenerExt;
 
-/// One supervised child process (anchor-backend or one of the MCP servers).
-struct Service {
+const MAX_LOG_BYTES: u64 = 10 * 1024 * 1024;
+const FAILURE_WINDOW_SECS: u64 = 5 * 60;
+const MAX_FAILURES: usize = 5;
+const STARTUP_GRACE_MS: u64 = 3000;
+
+#[derive(Clone, Debug)]
+struct ServiceDef {
     name: String,
     cmd: String,
     args: Vec<String>,
-    child: Option<Child>,
+    env: HashMap<String, String>,
+    /// Optional HTTP port (informational; not used by supervisor itself).
+    port: Option<u16>,
 }
 
-/// Mutable shared state held in Tauri's State.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ServiceState {
+    Stopped,
+    Starting,
+    Running,
+    Crashed,
+    Degraded,
+}
+
+struct ServiceRuntime {
+    def: ServiceDef,
+    child: Option<Child>,
+    state: ServiceState,
+    restarts: u32,
+    failures: Vec<Instant>,
+    backoff_ms: u64,
+    /// True when shutdown was requested — supervisor thread should NOT respawn.
+    shutdown_flag: bool,
+}
+
 struct Supervisor {
-    services: Mutex<Vec<Service>>,
+    services: Mutex<HashMap<String, ServiceRuntime>>,
     log_dir: PathBuf,
-    backend_port: u16,
 }
 
 impl Supervisor {
-    fn new() -> Self {
-        let home = env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-        let log_dir: PathBuf = env::var("ANCHOR_LOG_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from(format!("{}/.anchor/logs", home)));
+    fn new(defs: Vec<ServiceDef>, log_dir: PathBuf) -> Self {
+        let mut map = HashMap::new();
+        for def in defs {
+            map.insert(
+                def.name.clone(),
+                ServiceRuntime {
+                    def,
+                    child: None,
+                    state: ServiceState::Stopped,
+                    restarts: 0,
+                    failures: Vec::new(),
+                    backoff_ms: 1000,
+                    shutdown_flag: false,
+                },
+            );
+        }
         std::fs::create_dir_all(&log_dir).ok();
-
-        let backend_port: u16 = env::var("ANCHOR_BACKEND_PORT")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(3001);
-
-        // Default service definitions. Prod uses npm packages via npx; users
-        // can override via env ANCHOR_USE_LOCAL_DEV=true to run from
-        // ~/anchor-* checkouts (handy during dev).
-        let use_local = env::var("ANCHOR_USE_LOCAL_DEV").map(|v| v == "true").unwrap_or(false);
-        let services: Vec<Service> = if use_local {
-            vec![
-                ("anchor-backend",       "pnpm", vec!["tsx", &format!("{}/anchor-backend/server/index.ts", home)]),
-                ("anchor-activity-mcp",  "npx",  vec!["tsx", &format!("{}/anchor-activity-mcp/src/index.ts", home)]),
-                ("anchor-browser-mcp",   "npx",  vec!["tsx", &format!("{}/anchor-browser-mcp/src/index.ts", home)]),
-                ("anchor-input-mcp",     "npx",  vec!["tsx", &format!("{}/anchor-input-mcp/src/index.ts", home)]),
-                ("anchor-system-mcp",    "npx",  vec!["tsx", &format!("{}/anchor-system-mcp/src/index.ts", home)]),
-                ("anchor-screen-mcp",    "npx",  vec!["tsx", &format!("{}/anchor-screen-mcp/src/index.ts", home)]),
-                ("anchor-code-mcp",      "npx",  vec!["tsx", &format!("{}/anchor-code-mcp/src/index.ts", home)]),
-                ("anchor-shell-mcp",     "npx",  vec!["tsx", &format!("{}/anchor-shell-mcp/src/index.ts", home)]),
-            ]
-        } else {
-            vec![
-                ("anchor-backend",       "npx", vec!["-y", "@anchor/backend"]),
-                ("anchor-activity-mcp",  "npx", vec!["-y", "@anchor/activity-mcp"]),
-                ("anchor-browser-mcp",   "npx", vec!["-y", "@anchor/browser-mcp"]),
-                ("anchor-input-mcp",     "npx", vec!["-y", "@anchor/input-mcp"]),
-                ("anchor-system-mcp",    "npx", vec!["-y", "@anchor/system-mcp"]),
-                ("anchor-screen-mcp",    "npx", vec!["-y", "@anchor/screen-mcp"]),
-                ("anchor-code-mcp",      "npx", vec!["-y", "@anchor/code-mcp"]),
-                ("anchor-shell-mcp",     "npx", vec!["-y", "@anchor/shell-mcp"]),
-            ]
-        }
-        .into_iter()
-        .map(|(name, cmd, args)| Service {
-            name: name.to_string(),
-            cmd: cmd.to_string(),
-            args: args.into_iter().map(|s| s.to_string()).collect(),
-            child: None,
-        })
-        .collect();
-
         Self {
-            services: Mutex::new(services),
+            services: Mutex::new(map),
             log_dir,
-            backend_port,
         }
     }
 
-    fn start_all(&self) {
-        let mut svcs = self.services.lock().unwrap();
-        for svc in svcs.iter_mut() {
-            if svc.child.is_some() {
-                continue;
-            }
-            let log_path = self.log_dir.join(format!("{}.log", svc.name));
-            let log_file = OpenOptions::new()
-                .append(true)
-                .create(true)
-                .open(&log_path)
-                .ok();
+    fn log_path(&self, name: &str) -> PathBuf {
+        self.log_dir.join(format!("{}.log", name))
+    }
 
-            let mut env_vars: HashMap<String, String> = std::env::vars().collect();
-            env_vars.insert("PORT".into(), self.backend_port.to_string());
-            env_vars.insert("MCP_ENABLED".into(), "true".into());
-
-            let mut cmd = Command::new(&svc.cmd);
-            cmd.args(&svc.args).envs(env_vars);
-            if let Some(file) = log_file {
-                let stderr = file.try_clone().ok();
-                cmd.stdout(Stdio::from(file));
-                if let Some(s) = stderr {
-                    cmd.stderr(Stdio::from(s));
-                }
-            }
-            cmd.stdin(Stdio::null());
-
-            match cmd.spawn() {
-                Ok(child) => {
-                    println!("[supervisor] started {} (pid {})", svc.name, child.id());
-                    svc.child = Some(child);
-                }
-                Err(err) => {
-                    eprintln!("[supervisor] failed to start {}: {}", svc.name, err);
-                }
+    fn rotate_if_needed(&self, name: &str) {
+        let p = self.log_path(name);
+        if let Ok(meta) = std::fs::metadata(&p) {
+            if meta.len() > MAX_LOG_BYTES {
+                let _ = std::fs::rename(&p, p.with_extension("log.1"));
             }
         }
     }
 
-    fn stop_all(&self) {
-        let mut svcs = self.services.lock().unwrap();
-        for svc in svcs.iter_mut() {
-            if let Some(mut child) = svc.child.take() {
-                let _ = child.kill();
-                let _ = child.wait();
-                println!("[supervisor] stopped {}", svc.name);
+    /// Spawn one service, return the new Child (caller stores it).
+    fn spawn_one(&self, def: &ServiceDef) -> Option<Child> {
+        self.rotate_if_needed(&def.name);
+        let log_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.log_path(&def.name))
+            .ok()?;
+        let stderr_file = log_file.try_clone().ok()?;
+
+        let mut cmd = Command::new(&def.cmd);
+        cmd.args(&def.args)
+            .envs(env::vars())
+            .envs(def.env.iter())
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log_file))
+            .stderr(Stdio::from(stderr_file));
+
+        match cmd.spawn() {
+            Ok(child) => {
+                println!("[supervisor] started {} (pid {})", def.name, child.id());
+                Some(child)
+            }
+            Err(e) => {
+                eprintln!("[supervisor] failed to spawn {}: {}", def.name, e);
+                None
             }
         }
-    }
-
-    fn status(&self) -> Vec<(String, Option<u32>)> {
-        let svcs = self.services.lock().unwrap();
-        svcs.iter()
-            .map(|s| (s.name.clone(), s.child.as_ref().map(|c| c.id())))
-            .collect()
     }
 }
 
+/// Spawn one service + spawn its watcher thread. The watcher waits for the
+/// child to exit, then either respawns (with backoff) or marks DEGRADED.
+fn launch_with_watcher(sup: Arc<Supervisor>, name: String) {
+    let def = {
+        let mut map = sup.services.lock().unwrap();
+        let rt = match map.get_mut(&name) {
+            Some(r) => r,
+            None => return,
+        };
+        if rt.child.is_some() {
+            return; // already running
+        }
+        rt.shutdown_flag = false;
+        rt.state = ServiceState::Starting;
+        rt.def.clone()
+    };
+
+    let child = sup.spawn_one(&def);
+    {
+        let mut map = sup.services.lock().unwrap();
+        if let Some(rt) = map.get_mut(&name) {
+            rt.child = child;
+            if rt.child.is_none() {
+                rt.state = ServiceState::Crashed;
+                return;
+            }
+        }
+    }
+
+    // After grace period, flip Starting → Running unless something already
+    // happened (crashed / shutdown).
+    let sup_grace = sup.clone();
+    let name_grace = name.clone();
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(STARTUP_GRACE_MS));
+        let mut map = sup_grace.services.lock().unwrap();
+        if let Some(rt) = map.get_mut(&name_grace) {
+            if rt.state == ServiceState::Starting {
+                rt.state = ServiceState::Running;
+            }
+        }
+    });
+
+    // Watcher thread: take ownership of the child, wait for exit, decide.
+    let sup_w = sup.clone();
+    let name_w = name.clone();
+    thread::spawn(move || {
+        // Take the child out of the runtime so we can wait() without holding the lock.
+        let mut child_opt = {
+            let mut map = sup_w.services.lock().unwrap();
+            map.get_mut(&name_w).and_then(|rt| rt.child.take())
+        };
+        let exit_status = child_opt.as_mut().and_then(|c| c.wait().ok());
+
+        let respawn_after = {
+            let mut map = sup_w.services.lock().unwrap();
+            let rt = match map.get_mut(&name_w) {
+                Some(r) => r,
+                None => return,
+            };
+            rt.child = None;
+            if rt.shutdown_flag {
+                rt.state = ServiceState::Stopped;
+                return;
+            }
+            rt.state = ServiceState::Crashed;
+            rt.failures.push(Instant::now());
+            let cutoff = Instant::now() - Duration::from_secs(FAILURE_WINDOW_SECS);
+            rt.failures.retain(|t| *t > cutoff);
+
+            if rt.failures.len() >= MAX_FAILURES {
+                rt.state = ServiceState::Degraded;
+                eprintln!(
+                    "[supervisor] {} DEGRADED ({} crashes in {}s) — manual restart needed",
+                    name_w,
+                    rt.failures.len(),
+                    FAILURE_WINDOW_SECS
+                );
+                return;
+            }
+
+            let delay = rt.backoff_ms;
+            rt.backoff_ms = (rt.backoff_ms * 2).min(60_000);
+            rt.restarts += 1;
+            eprintln!(
+                "[supervisor] {} crashed ({:?}) — restarting in {}ms",
+                name_w, exit_status, delay
+            );
+            delay
+        };
+
+        thread::sleep(Duration::from_millis(respawn_after));
+        launch_with_watcher(sup_w, name_w);
+    });
+}
+
+fn start_all(sup: Arc<Supervisor>) {
+    let names: Vec<String> = sup
+        .services
+        .lock()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect();
+    for n in names {
+        launch_with_watcher(sup.clone(), n);
+    }
+}
+
+fn stop_all(sup: &Supervisor) {
+    let mut map = sup.services.lock().unwrap();
+    for (_, rt) in map.iter_mut() {
+        rt.shutdown_flag = true;
+        if let Some(mut child) = rt.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+            rt.state = ServiceState::Stopped;
+        }
+    }
+}
+
+fn manual_restart(sup: Arc<Supervisor>, name: &str) {
+    {
+        let mut map = sup.services.lock().unwrap();
+        if let Some(rt) = map.get_mut(name) {
+            rt.shutdown_flag = true;
+            if let Some(mut child) = rt.child.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            rt.failures.clear();
+            rt.backoff_ms = 1000;
+            rt.shutdown_flag = false;
+        }
+    }
+    launch_with_watcher(sup, name.to_string());
+}
+
+/// Snapshot of service state for the status dialog.
+fn status_snapshot(sup: &Supervisor) -> Vec<(String, ServiceState, u32, Option<u16>)> {
+    let map = sup.services.lock().unwrap();
+    map.values()
+        .map(|rt| (rt.def.name.clone(), rt.state, rt.restarts, rt.def.port))
+        .collect()
+}
+
+// ── Default service stack ───────────────────────────────────────────────────
+
+fn default_stack() -> Vec<ServiceDef> {
+    let home = env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    let use_local = env::var("ANCHOR_USE_LOCAL_DEV")
+        .map(|v| v == "true")
+        .unwrap_or(false);
+
+    let backend_port: u16 = env::var("ANCHOR_BACKEND_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3001);
+    let admin_port: u16 = 3002;
+    let security_port: u16 = 3004;
+    let anchor_db = format!("{}/anchor-backend/server/infra/anchor.db", home);
+    let security_token = env::var("SECURITY_API_TOKEN")
+        .unwrap_or_else(|_| "dev-security-token-change-me".into());
+    let push_token = env::var("PUSH_TOKEN").unwrap_or_else(|_| "dev-push-token-change-me".into());
+
+    let mut backend_env: HashMap<String, String> = HashMap::new();
+    backend_env.insert("PORT".into(), backend_port.to_string());
+    backend_env.insert("MCP_ENABLED".into(), "true".into());
+
+    let mut admin_env: HashMap<String, String> = HashMap::new();
+    admin_env.insert("PORT".into(), admin_port.to_string());
+    admin_env.insert("ANCHOR_DB_PATH".into(), anchor_db.clone());
+    admin_env.insert("SECURITY_API_URL".into(), format!("http://localhost:{}", security_port));
+    admin_env.insert("SECURITY_API_TOKEN".into(), security_token.clone());
+
+    let mut security_env: HashMap<String, String> = HashMap::new();
+    security_env.insert("PORT".into(), security_port.to_string());
+    security_env.insert("ANCHOR_DB_PATH".into(), anchor_db);
+    security_env.insert("SECURITY_DB_PATH".into(), format!("{}/anchor-security/security.db", home));
+    security_env.insert("DETECT_TICK_MS".into(), "30000".into());
+    security_env.insert("PENTEST_TARGET".into(), format!("http://localhost:{}", backend_port));
+    security_env.insert("PENTEST_ADMIN_TARGET".into(), format!("http://localhost:{}", admin_port));
+    security_env.insert("ADMIN_API_TOKEN".into(), security_token);
+    security_env.insert("PUSH_TOKEN".into(), push_token);
+
+    if use_local {
+        vec![
+            ServiceDef {
+                name: "anchor-backend".into(),
+                cmd: "pnpm".into(),
+                args: vec!["tsx".into(), format!("{}/anchor-backend/server/index.ts", home)],
+                env: backend_env,
+                port: Some(backend_port),
+            },
+            ServiceDef {
+                name: "anchor-admin-backend".into(),
+                cmd: "pnpm".into(),
+                args: vec!["tsx".into(), format!("{}/anchor-admin-backend/server/index.ts", home)],
+                env: admin_env,
+                port: Some(admin_port),
+            },
+            ServiceDef {
+                name: "anchor-security".into(),
+                cmd: "pnpm".into(),
+                args: vec!["tsx".into(), format!("{}/anchor-security/server/index.ts", home)],
+                env: security_env,
+                port: Some(security_port),
+            },
+        ]
+    } else {
+        vec![
+            ServiceDef {
+                name: "anchor-backend".into(),
+                cmd: "npx".into(),
+                args: vec!["-y".into(), "@anchor/backend".into()],
+                env: backend_env,
+                port: Some(backend_port),
+            },
+            ServiceDef {
+                name: "anchor-admin-backend".into(),
+                cmd: "npx".into(),
+                args: vec!["-y".into(), "@anchor/admin-backend".into()],
+                env: admin_env,
+                port: Some(admin_port),
+            },
+            ServiceDef {
+                name: "anchor-security".into(),
+                cmd: "npx".into(),
+                args: vec!["-y".into(), "@anchor/security".into()],
+                env: security_env,
+                port: Some(security_port),
+            },
+        ]
+    }
+}
+
+// ── Tauri app entry ────────────────────────────────────────────────────────
+
 fn main() {
-    let supervisor = Supervisor::new();
-    let backend_port = supervisor.backend_port;
+    let home = env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    let log_dir: PathBuf = env::var("ANCHOR_LOG_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(format!("{}/.anchor/logs", home)));
+
+    let supervisor = Arc::new(Supervisor::new(default_stack(), log_dir.clone()));
+    let backend_port: u16 = env::var("ANCHOR_BACKEND_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3001);
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_opener::init())
-        .manage(supervisor)
-        .setup(move |app| {
-            // Start all services on launch
-            let sup: tauri::State<Supervisor> = app.state();
-            sup.start_all();
+        .plugin(tauri_plugin_autostart::init(
+            MacosLauncher::LaunchAgent,
+            Some(vec![]),
+        ))
+        .manage(supervisor.clone())
+        .setup({
+            let supervisor = supervisor.clone();
+            move |app| {
+                start_all(supervisor.clone());
 
-            // Build tray menu
-            let open_ui  = MenuItem::with_id(app, "open_ui",  "Open Anchor",        true, None::<&str>)?;
-            let status   = MenuItem::with_id(app, "status",   "Status",             true, None::<&str>)?;
-            let restart  = MenuItem::with_id(app, "restart",  "Restart all",        true, None::<&str>)?;
-            let logs     = MenuItem::with_id(app, "logs",     "Open log folder",    true, None::<&str>)?;
-            let sep      = PredefinedMenuItem::separator(app)?;
-            let quit     = MenuItem::with_id(app, "quit",     "Quit Anchor",        true, None::<&str>)?;
+                let open_ui = MenuItem::with_id(app, "open_ui", "Open Anchor", true, None::<&str>)?;
+                let status = MenuItem::with_id(app, "status", "Status", true, None::<&str>)?;
+                let restart_all =
+                    MenuItem::with_id(app, "restart_all", "Restart all", true, None::<&str>)?;
+                let logs = MenuItem::with_id(app, "logs", "Open log folder", true, None::<&str>)?;
+                let sep = PredefinedMenuItem::separator(app)?;
+                let quit = MenuItem::with_id(app, "quit", "Quit Anchor", true, None::<&str>)?;
 
-            let menu = Menu::with_items(app, &[&open_ui, &status, &restart, &logs, &sep, &quit])?;
+                let menu = Menu::with_items(
+                    app,
+                    &[&open_ui, &status, &restart_all, &logs, &sep, &quit],
+                )?;
 
-            let _tray = TrayIconBuilder::with_id("anchor-tray")
-                .icon(app.default_window_icon().unwrap().clone())
-                .menu(&menu)
-                .menu_on_left_click(true)
-                .on_menu_event(move |app_handle, event| {
-                    let id = event.id.as_ref();
-                    match id {
+                let log_dir_menu = log_dir.clone();
+                let _tray = TrayIconBuilder::with_id("anchor-tray")
+                    .icon(app.default_window_icon().unwrap().clone())
+                    .menu(&menu)
+                    .show_menu_on_left_click(true)
+                    .on_menu_event(move |app_handle, event| match event.id.as_ref() {
                         "open_ui" => {
                             let url = format!("http://localhost:{}", backend_port);
                             let _ = app_handle.opener().open_url(&url, None::<String>);
                         }
                         "status" => {
-                            let sup: tauri::State<Supervisor> = app_handle.state();
-                            let s = sup.status();
-                            let lines: Vec<String> = s.into_iter()
-                                .map(|(name, pid)| format!("{}: {}", name, pid.map(|p| format!("pid {}", p)).unwrap_or_else(|| "STOPPED".into())))
+                            let sup: tauri::State<Arc<Supervisor>> = app_handle.state();
+                            let snap = status_snapshot(&sup);
+                            let lines: Vec<String> = snap
+                                .into_iter()
+                                .map(|(name, state, restarts, port)| {
+                                    format!(
+                                        "{:<22} {:?} restarts={} port={:?}",
+                                        name, state, restarts, port
+                                    )
+                                })
                                 .collect();
-                            // Open a window or print to console — for v0.1 just log
                             println!("[Anchor Status]\n{}", lines.join("\n"));
                         }
-                        "restart" => {
-                            let sup: tauri::State<Supervisor> = app_handle.state();
-                            sup.stop_all();
-                            std::thread::sleep(std::time::Duration::from_millis(500));
-                            sup.start_all();
+                        "restart_all" => {
+                            let sup: tauri::State<Arc<Supervisor>> = app_handle.state();
+                            let names: Vec<String> = sup
+                                .services
+                                .lock()
+                                .unwrap()
+                                .keys()
+                                .cloned()
+                                .collect();
+                            for n in names {
+                                manual_restart(sup.inner().clone(), &n);
+                            }
                         }
                         "logs" => {
-                            let sup: tauri::State<Supervisor> = app_handle.state();
-                            let path = sup.log_dir.to_string_lossy().to_string();
+                            let path = log_dir_menu.to_string_lossy().to_string();
                             let _ = app_handle.opener().open_path(path, None::<String>);
                         }
                         "quit" => {
-                            let sup: tauri::State<Supervisor> = app_handle.state();
-                            sup.stop_all();
+                            let sup: tauri::State<Arc<Supervisor>> = app_handle.state();
+                            stop_all(&sup);
                             app_handle.exit(0);
                         }
                         _ => {}
-                    }
-                })
-                .on_tray_icon_event(|tray, event| {
-                    if let TrayIconEvent::Click { .. } = event {
-                        // Optional: clicking the icon (not menu item) could show window
-                        let _ = tray;
-                    }
-                })
-                .build(app)?;
+                    })
+                    .build(app)?;
 
-            Ok(())
+                Ok(())
+            }
         })
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
@@ -225,9 +485,3 @@ fn main() {
         .run(tauri::generate_context!())
         .expect("error while running anchor-tray-app");
 }
-
-// Note: ensure clean shutdown of children when app exits — Tauri's exit
-// goes through .exit() above which calls stop_all() via the menu handler.
-// For unexpected termination (kill -9), child processes will be inherited
-// by init/launchd; supervisor pattern recommends adding a post-exit ctrlC
-// handler in a follow-up version.

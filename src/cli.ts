@@ -62,8 +62,10 @@ if (cmd === "start") {
   anchor restart <name>    restart a single service
   anchor logs <name>       tail the service's log
 
-Services managed: anchor-backend / anchor-activity-mcp / anchor-browser-mcp /
-anchor-input-mcp / anchor-system-mcp / anchor-screen-mcp / anchor-code-mcp
+Services managed: anchor-backend (:3001) / anchor-admin-backend (:3002) /
+anchor-security (:3004). The 7 anchor-*-mcp servers are spawned by
+anchor-backend's MCP host (not by this supervisor) — they need stdin piped
+for JSON-RPC over stdio.
 
 --dev = run from local ~/anchor-* checkouts via tsx (instead of npm packages).`);
   process.exit(cmd === "help" || cmd === "--help" ? 0 : 1);

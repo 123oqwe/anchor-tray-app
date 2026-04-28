@@ -165,21 +165,55 @@ export function restart(name: string): boolean {
 
 export function defaultStack(opts: { backendPort?: number; useLocalDev?: boolean } = {}): ServiceDef[] {
   const port = opts.backendPort ?? 3001;
-  const env = {
+  const adminPort = 3002;
+  const securityPort = 3004;
+  const HOME = os.homedir();
+  const ANCHOR_DB = `${HOME}/anchor-backend/server/infra/anchor.db`;
+
+  // anchor-backend env
+  const backendEnv: Record<string, string> = {
     PORT: String(port),
     MCP_ENABLED: "true",
     ...(process.env.ANTHROPIC_API_KEY ? { ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY } : {}),
     ...(process.env.OPENAI_API_KEY ? { OPENAI_API_KEY: process.env.OPENAI_API_KEY } : {}),
+    ...(process.env.OPENROUTER_API_KEY ? { OPENROUTER_API_KEY: process.env.OPENROUTER_API_KEY } : {}),
   };
 
+  // admin-backend env — points at the same anchor.db (multi-process WAL)
+  const adminEnv: Record<string, string> = {
+    PORT: String(adminPort),
+    ANCHOR_DB_PATH: ANCHOR_DB,
+    SECURITY_API_URL: `http://localhost:${securityPort}`,
+    SECURITY_API_TOKEN: process.env.SECURITY_API_TOKEN ?? "dev-security-token-change-me",
+  };
+
+  // security env — RW on its own db, RO on anchor.db
+  const securityEnv: Record<string, string> = {
+    PORT: String(securityPort),
+    ANCHOR_DB_PATH: ANCHOR_DB,
+    SECURITY_DB_PATH: `${HOME}/anchor-security/security.db`,
+    DETECT_TICK_MS: "30000",
+    PENTEST_TARGET: `http://localhost:${port}`,
+    PENTEST_ADMIN_TARGET: `http://localhost:${adminPort}`,
+    ADMIN_API_TOKEN: process.env.SECURITY_API_TOKEN ?? "dev-security-token-change-me",
+    PUSH_TOKEN: process.env.PUSH_TOKEN ?? "dev-push-token-change-me",
+  };
+
+  // MCP servers are NOT in this list — anchor-backend's MCP host spawns
+  // them with stdin piped (they need active stdin for JSON-RPC; supervising
+  // with stdio:'ignore' makes them EOF and crash-loop).
+
   if (opts.useLocalDev) {
-    const HOME = os.homedir();
     return [
-      { name: "anchor-backend", command: "pnpm", args: ["tsx", `${HOME}/anchor-backend/server/index.ts`], env, port },
+      { name: "anchor-backend",       command: "pnpm", args: ["tsx", `${HOME}/anchor-backend/server/index.ts`],            env: backendEnv,  port },
+      { name: "anchor-admin-backend", command: "pnpm", args: ["tsx", `${HOME}/anchor-admin-backend/server/index.ts`],      env: adminEnv,    port: adminPort,    startupGraceMs: 3000 },
+      { name: "anchor-security",      command: "pnpm", args: ["tsx", `${HOME}/anchor-security/server/index.ts`],            env: securityEnv, port: securityPort, startupGraceMs: 3000 },
     ];
   }
 
   return [
-    { name: "anchor-backend", command: "npx", args: ["-y", "@anchor/backend"], env, port },
+    { name: "anchor-backend",       command: "npx", args: ["-y", "@anchor/backend"],        env: backendEnv,  port },
+    { name: "anchor-admin-backend", command: "npx", args: ["-y", "@anchor/admin-backend"],  env: adminEnv,    port: adminPort,    startupGraceMs: 3000 },
+    { name: "anchor-security",      command: "npx", args: ["-y", "@anchor/security"],       env: securityEnv, port: securityPort, startupGraceMs: 3000 },
   ];
 }

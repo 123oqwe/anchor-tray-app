@@ -293,94 +293,89 @@ fn status_snapshot(sup: &Supervisor) -> Vec<(String, ServiceState, u32, Option<u
         .collect()
 }
 
-// ── Default service stack ───────────────────────────────────────────────────
+// ── Default service stack — read from ../stack.json ────────────────────────
+// Single source of truth; the TS supervisor reads the same file. (Phase FIX-6)
+
+#[derive(serde::Deserialize)]
+struct StackLauncher {
+    command: String,
+    args: Vec<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct StackService {
+    name: String,
+    port: u16,
+    dev: StackLauncher,
+    prod: StackLauncher,
+    env_keys: Vec<String>,
+    #[allow(dead_code)]
+    startup_grace_ms: Option<u64>,
+}
+
+#[derive(serde::Deserialize)]
+struct StackJson {
+    services: Vec<StackService>,
+}
+
+fn load_stack() -> StackJson {
+    let candidates = [
+        "stack.json".to_string(),
+        "../stack.json".to_string(),
+        format!("{}/anchor-tray-app/stack.json", env::var("HOME").unwrap_or_default()),
+    ];
+    for p in &candidates {
+        if let Ok(s) = std::fs::read_to_string(p) {
+            if let Ok(parsed) = serde_json::from_str::<StackJson>(&s) {
+                return parsed;
+            }
+        }
+    }
+    panic!("stack.json not found in: {}", candidates.join(", "));
+}
+
+fn expand_home(s: &str, home: &str) -> String {
+    s.replace("${HOME}", home)
+}
 
 fn default_stack() -> Vec<ServiceDef> {
     let home = env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    let use_local = env::var("ANCHOR_USE_LOCAL_DEV")
-        .map(|v| v == "true")
-        .unwrap_or(false);
-
-    let backend_port: u16 = env::var("ANCHOR_BACKEND_PORT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(3001);
-    let admin_port: u16 = 3002;
-    let security_port: u16 = 3004;
+    let use_local = env::var("ANCHOR_USE_LOCAL_DEV").map(|v| v == "true").unwrap_or(false);
+    let stack = load_stack();
     let anchor_db = format!("{}/anchor-backend/server/infra/anchor.db", home);
-    let security_token = env::var("SECURITY_API_TOKEN")
-        .unwrap_or_else(|_| "dev-security-token-change-me".into());
+    let security_token = env::var("SECURITY_API_TOKEN").unwrap_or_else(|_| "dev-security-token-change-me".into());
     let push_token = env::var("PUSH_TOKEN").unwrap_or_else(|_| "dev-push-token-change-me".into());
+    let backend_port: u16 = env::var("ANCHOR_BACKEND_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(3001);
 
-    let mut backend_env: HashMap<String, String> = HashMap::new();
-    backend_env.insert("PORT".into(), backend_port.to_string());
-    backend_env.insert("MCP_ENABLED".into(), "true".into());
-
-    let mut admin_env: HashMap<String, String> = HashMap::new();
-    admin_env.insert("PORT".into(), admin_port.to_string());
-    admin_env.insert("ANCHOR_DB_PATH".into(), anchor_db.clone());
-    admin_env.insert("SECURITY_API_URL".into(), format!("http://localhost:{}", security_port));
-    admin_env.insert("SECURITY_API_TOKEN".into(), security_token.clone());
-
-    let mut security_env: HashMap<String, String> = HashMap::new();
-    security_env.insert("PORT".into(), security_port.to_string());
-    security_env.insert("ANCHOR_DB_PATH".into(), anchor_db);
-    security_env.insert("SECURITY_DB_PATH".into(), format!("{}/anchor-security/security.db", home));
-    security_env.insert("DETECT_TICK_MS".into(), "30000".into());
-    security_env.insert("PENTEST_TARGET".into(), format!("http://localhost:{}", backend_port));
-    security_env.insert("PENTEST_ADMIN_TARGET".into(), format!("http://localhost:{}", admin_port));
-    security_env.insert("ADMIN_API_TOKEN".into(), security_token);
-    security_env.insert("PUSH_TOKEN".into(), push_token);
-
-    if use_local {
-        vec![
-            ServiceDef {
-                name: "anchor-backend".into(),
-                cmd: "pnpm".into(),
-                args: vec!["tsx".into(), format!("{}/anchor-backend/server/index.ts", home)],
-                env: backend_env,
-                port: Some(backend_port),
-            },
-            ServiceDef {
-                name: "anchor-admin-backend".into(),
-                cmd: "pnpm".into(),
-                args: vec!["tsx".into(), format!("{}/anchor-admin-backend/server/index.ts", home)],
-                env: admin_env,
-                port: Some(admin_port),
-            },
-            ServiceDef {
-                name: "anchor-security".into(),
-                cmd: "pnpm".into(),
-                args: vec!["tsx".into(), format!("{}/anchor-security/server/index.ts", home)],
-                env: security_env,
-                port: Some(security_port),
-            },
-        ]
-    } else {
-        vec![
-            ServiceDef {
-                name: "anchor-backend".into(),
-                cmd: "npx".into(),
-                args: vec!["-y".into(), "@anchor/backend".into()],
-                env: backend_env,
-                port: Some(backend_port),
-            },
-            ServiceDef {
-                name: "anchor-admin-backend".into(),
-                cmd: "npx".into(),
-                args: vec!["-y".into(), "@anchor/admin-backend".into()],
-                env: admin_env,
-                port: Some(admin_port),
-            },
-            ServiceDef {
-                name: "anchor-security".into(),
-                cmd: "npx".into(),
-                args: vec!["-y".into(), "@anchor/security".into()],
-                env: security_env,
-                port: Some(security_port),
-            },
-        ]
-    }
+    stack.services.into_iter().map(|svc| {
+        let launcher = if use_local { &svc.dev } else { &svc.prod };
+        let mut env: HashMap<String, String> = HashMap::new();
+        for k in &svc.env_keys {
+            match k.as_str() {
+                "PORT" => {
+                    let port = if svc.name == "anchor-backend" { backend_port } else { svc.port };
+                    env.insert("PORT".into(), port.to_string());
+                }
+                "ANCHOR_DB_PATH" => { env.insert(k.clone(), anchor_db.clone()); }
+                "MCP_ENABLED" => { env.insert(k.clone(), "true".into()); }
+                "SECURITY_API_URL" => { env.insert(k.clone(), "http://localhost:3004".into()); }
+                "SECURITY_DB_PATH" => { env.insert(k.clone(), format!("{}/anchor-security/security.db", home)); }
+                "DETECT_TICK_MS" => { env.insert(k.clone(), "30000".into()); }
+                "PENTEST_TARGET" => { env.insert(k.clone(), "http://localhost:3001".into()); }
+                "PENTEST_ADMIN_TARGET" => { env.insert(k.clone(), "http://localhost:3002".into()); }
+                "SECURITY_API_TOKEN" | "ADMIN_API_TOKEN" => { env.insert(k.clone(), security_token.clone()); }
+                "PUSH_TOKEN" => { env.insert(k.clone(), push_token.clone()); }
+                _ => { if let Ok(v) = env::var(k) { env.insert(k.clone(), v); } }
+            }
+        }
+        ServiceDef {
+            name: svc.name.clone(),
+            cmd: launcher.command.clone(),
+            args: launcher.args.iter().map(|a| expand_home(a, &home)).collect(),
+            env,
+            port: Some(svc.port),
+        }
+    }).collect()
 }
 
 // ── Tauri app entry ────────────────────────────────────────────────────────

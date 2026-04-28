@@ -163,57 +163,91 @@ export function restart(name: string): boolean {
 
 // ── Default anchor stack ───────────────────────────────────────────────────
 
+// Single source of truth for service definitions: ../stack.json
+// (Both this TS supervisor and src-tauri/src/main.rs read it.)
+interface StackJson {
+  services: Array<{
+    name: string;
+    port: number;
+    dev: { command: string; args: string[] };
+    prod: { command: string; args: string[] };
+    env_keys: string[];
+    startup_grace_ms?: number;
+  }>;
+}
+
+function loadStack(): StackJson {
+  const candidates = [
+    path.join(process.cwd(), "stack.json"),
+    path.join(process.cwd(), "..", "stack.json"),
+    "/Users/guanjieqiao/anchor-tray-app/stack.json",
+  ];
+  for (const p of candidates) {
+    try { return JSON.parse(fs.readFileSync(p, "utf8")); } catch { /* try next */ }
+  }
+  throw new Error(`stack.json not found in: ${candidates.join(", ")}`);
+}
+
+function expandHome(s: string): string {
+  return s.replace(/\$\{HOME\}/g, os.homedir());
+}
+
 export function defaultStack(opts: { backendPort?: number; useLocalDev?: boolean } = {}): ServiceDef[] {
-  const port = opts.backendPort ?? 3001;
-  const adminPort = 3002;
-  const securityPort = 3004;
+  const stack = loadStack();
   const HOME = os.homedir();
   const ANCHOR_DB = `${HOME}/anchor-backend/server/infra/anchor.db`;
 
-  // anchor-backend env
-  const backendEnv: Record<string, string> = {
-    PORT: String(port),
-    MCP_ENABLED: "true",
-    ...(process.env.ANTHROPIC_API_KEY ? { ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY } : {}),
-    ...(process.env.OPENAI_API_KEY ? { OPENAI_API_KEY: process.env.OPENAI_API_KEY } : {}),
-    ...(process.env.OPENROUTER_API_KEY ? { OPENROUTER_API_KEY: process.env.OPENROUTER_API_KEY } : {}),
+  const buildEnv = (svc: StackJson["services"][number]): Record<string, string> => {
+    const out: Record<string, string> = {};
+    for (const k of svc.env_keys) {
+      switch (k) {
+        case "PORT":
+          out.PORT = String(opts.backendPort && svc.name === "anchor-backend" ? opts.backendPort : svc.port);
+          break;
+        case "ANCHOR_DB_PATH":
+          out.ANCHOR_DB_PATH = ANCHOR_DB;
+          break;
+        case "MCP_ENABLED":
+          out.MCP_ENABLED = "true";
+          break;
+        case "SECURITY_API_URL":
+          out.SECURITY_API_URL = "http://localhost:3004";
+          break;
+        case "SECURITY_DB_PATH":
+          out.SECURITY_DB_PATH = `${HOME}/anchor-security/security.db`;
+          break;
+        case "DETECT_TICK_MS":
+          out.DETECT_TICK_MS = "30000";
+          break;
+        case "PENTEST_TARGET":
+          out.PENTEST_TARGET = "http://localhost:3001";
+          break;
+        case "PENTEST_ADMIN_TARGET":
+          out.PENTEST_ADMIN_TARGET = "http://localhost:3002";
+          break;
+        case "SECURITY_API_TOKEN":
+        case "ADMIN_API_TOKEN":
+          out[k] = process.env.SECURITY_API_TOKEN ?? "dev-security-token-change-me";
+          break;
+        case "PUSH_TOKEN":
+          out.PUSH_TOKEN = process.env.PUSH_TOKEN ?? "dev-push-token-change-me";
+          break;
+        default:
+          if (process.env[k]) out[k] = process.env[k]!;
+      }
+    }
+    return out;
   };
 
-  // admin-backend env — points at the same anchor.db (multi-process WAL)
-  const adminEnv: Record<string, string> = {
-    PORT: String(adminPort),
-    ANCHOR_DB_PATH: ANCHOR_DB,
-    SECURITY_API_URL: `http://localhost:${securityPort}`,
-    SECURITY_API_TOKEN: process.env.SECURITY_API_TOKEN ?? "dev-security-token-change-me",
-  };
-
-  // security env — RW on its own db, RO on anchor.db
-  const securityEnv: Record<string, string> = {
-    PORT: String(securityPort),
-    ANCHOR_DB_PATH: ANCHOR_DB,
-    SECURITY_DB_PATH: `${HOME}/anchor-security/security.db`,
-    DETECT_TICK_MS: "30000",
-    PENTEST_TARGET: `http://localhost:${port}`,
-    PENTEST_ADMIN_TARGET: `http://localhost:${adminPort}`,
-    ADMIN_API_TOKEN: process.env.SECURITY_API_TOKEN ?? "dev-security-token-change-me",
-    PUSH_TOKEN: process.env.PUSH_TOKEN ?? "dev-push-token-change-me",
-  };
-
-  // MCP servers are NOT in this list — anchor-backend's MCP host spawns
-  // them with stdin piped (they need active stdin for JSON-RPC; supervising
-  // with stdio:'ignore' makes them EOF and crash-loop).
-
-  if (opts.useLocalDev) {
-    return [
-      { name: "anchor-backend",       command: "pnpm", args: ["tsx", `${HOME}/anchor-backend/server/index.ts`],            env: backendEnv,  port },
-      { name: "anchor-admin-backend", command: "pnpm", args: ["tsx", `${HOME}/anchor-admin-backend/server/index.ts`],      env: adminEnv,    port: adminPort,    startupGraceMs: 3000 },
-      { name: "anchor-security",      command: "pnpm", args: ["tsx", `${HOME}/anchor-security/server/index.ts`],            env: securityEnv, port: securityPort, startupGraceMs: 3000 },
-    ];
-  }
-
-  return [
-    { name: "anchor-backend",       command: "npx", args: ["-y", "@anchor/backend"],        env: backendEnv,  port },
-    { name: "anchor-admin-backend", command: "npx", args: ["-y", "@anchor/admin-backend"],  env: adminEnv,    port: adminPort,    startupGraceMs: 3000 },
-    { name: "anchor-security",      command: "npx", args: ["-y", "@anchor/security"],       env: securityEnv, port: securityPort, startupGraceMs: 3000 },
-  ];
+  return stack.services.map(svc => {
+    const launcher = opts.useLocalDev ? svc.dev : svc.prod;
+    return {
+      name: svc.name,
+      command: launcher.command,
+      args: launcher.args.map(expandHome),
+      env: buildEnv(svc),
+      port: svc.port,
+      startupGraceMs: svc.startup_grace_ms,
+    };
+  });
 }

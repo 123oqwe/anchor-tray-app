@@ -1,0 +1,30 @@
+{
+  "$schema": "https://anchor.app/schemas/stack-v1.json",
+  "_comment": "Shared service definitions. Read by both src/supervisor.ts (TS CLI) and src-tauri/src/main.rs (Tauri tray) — keep them in lockstep here, not in two places. MCP servers are NOT in this list — they are stdio JSON-RPC peers and are spawned by anchor-backend's MCP host with stdin piped.",
+  "services": [
+    {
+      "name": "anchor-backend",
+      "port": 3001,
+      "dev": { "command": "pnpm", "args": ["tsx", "${HOME}/anchor-backend/server/index.ts"] },
+      "prod": { "command": "npx", "args": ["-y", "@anchor/backend"] },
+      "env_keys": ["PORT", "MCP_ENABLED", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY"],
+      "startup_grace_ms": 2000
+    },
+    {
+      "name": "anchor-admin-backend",
+      "port": 3002,
+      "dev": { "command": "pnpm", "args": ["tsx", "${HOME}/anchor-admin-backend/server/index.ts"] },
+      "prod": { "command": "npx", "args": ["-y", "@anchor/admin-backend"] },
+      "env_keys": ["PORT", "ANCHOR_DB_PATH", "SECURITY_API_URL", "SECURITY_API_TOKEN"],
+      "startup_grace_ms": 3000
+    },
+    {
+      "name": "anchor-security",
+      "port": 3004,
+      "dev": { "command": "pnpm", "args": ["tsx", "${HOME}/anchor-security/server/index.ts"] },
+      "prod": { "command": "npx", "args": ["-y", "@anchor/security"] },
+      "env_keys": ["PORT", "ANCHOR_DB_PATH", "SECURITY_DB_PATH", "DETECT_TICK_MS", "PENTEST_TARGET", "PENTEST_ADMIN_TARGET", "ADMIN_API_TOKEN", "PUSH_TOKEN"],
+      "startup_grace_ms": 3000
+    }
+  ]
+}
